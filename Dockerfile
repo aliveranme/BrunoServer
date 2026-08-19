@@ -16,11 +16,13 @@ COPY server.py server.py
 # 暴露端口
 EXPOSE 5000
 
-# 默认许可证配置（可通过 docker run -e 覆盖）
+# 默认配置（可通过 docker run -e 覆盖）
 ENV FLASK_HOST=0.0.0.0
 ENV FLASK_PORT=5000
 ENV BRUNO_LICENSE_PLAN=ULTIMATE_EDITION
 ENV BRUNO_LICENSE_TYPE=personal
+ENV TRIAL_DURATION_DAYS=14
+ENV PENDING_EXPIRY_SECONDS=1800
 
 # 启动应用
 CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "--access-logfile", "-", "server:app"]

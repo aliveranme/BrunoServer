@@ -11,3 +11,7 @@ services:
         value: ULTIMATE_EDITION
       - key: BRUNO_LICENSE_TYPE
         value: personal
+      - key: TRIAL_DURATION_DAYS
+        value: "14"
+      - key: PENDING_EXPIRY_SECONDS
+        value: "1800"

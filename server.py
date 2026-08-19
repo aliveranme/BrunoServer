@@ -1,15 +1,23 @@
 """
-Bruno 自托管许可证验证服务器
+Bruno 自托管许可证验证服务器 v2.1.0
 
 基于从 Bruno v4.0.0 app.asar 逆向提取的 src/utils/license.js 源码实现。
 支持完整的许可证激活、OTP 验证、许可证验证、刷新、试用许可证等全部 API 端点。
 
 Bruno 客户端的许可证验证流程：
-1. 用户输入许可证密钥 → POST /api/v2/license/activate → 返回 activationId（需要 OTP 验证）
-   或直接返回 licenseToken（组织许可证，无需 OTP）
-2. 用户输入 OTP → POST /api/v1/license/activate/<activationId> → 返回 licenseToken (JWT)
-3. 客户端定期后台验证 → POST /api/v2/license/verify → 返回 { verified, subscription, needsRefresh }
-4. 如需刷新令牌 → POST /api/v2/license/refresh → 返回新的 licenseToken
+
+  路径 A — 个人许可证（OTP 验证）:
+    1. POST /api/v2/license/activate → 返回 activationId
+    2. POST /api/v1/license/activate/<activationId> → 返回 licenseToken (JWT)
+       客户端设置 licenseType='personal'
+
+  路径 B — 组织许可证（直接激活，跳过 OTP）:
+    1. POST /api/v2/license/activate → 直接返回 licenseToken
+       客户端设置 licenseType='organization'
+
+  后台验证（定期执行）:
+    3. POST /api/v2/license/verify → { verified, subscription, needsRefresh }
+    4. 如 needsRefresh=true → POST /api/v2/license/refresh → 返回新 licenseToken
 
 licenseToken 是一个 JWT，Bruno 客户端仅做 jwt.decode()（不验签名），
 检查 payload 中的 deviceId 是否匹配本机 machineIdSync()。
@@ -21,6 +29,8 @@ import json
 import base64
 import hashlib
 import logging
+import threading
+import time
 
 from flask import Flask, jsonify, request
 
@@ -34,31 +44,47 @@ logging.basicConfig(
 )
 log = logging.getLogger("BrunoServer")
 
-# --- 内存存储 ---
-PENDING_ACTIVATIONS = {}       # activationId → 激活请求详情
-ACTIVE_LICENSES = {}           # licenseToken → 许可证详情（用于 verify 端点）
-ACTIVATION_SESSIONS = {}       # sessionId → 激活会话
-
 # --- 环境变量配置 ---
 DEFAULT_PLAN = os.getenv("BRUNO_LICENSE_PLAN", "ULTIMATE_EDITION")
 # PRO_EDITION < GOLDEN_EDITION < ULTIMATE_EDITION
 DEFAULT_LICENSE_TYPE = os.getenv("BRUNO_LICENSE_TYPE", "personal")
 # "personal" 或 "organization"
+# 当为 "organization" 时，activate 端点直接返回 licenseToken（跳过 OTP）
+# 当为 "personal" 时，activate 端点返回 activationId（需要 OTP 验证）
 
+# 待激活请求过期时间（秒），默认 30 分钟
+PENDING_EXPIRY_SECONDS = int(os.getenv("PENDING_EXPIRY_SECONDS", "1800"))
+
+# 试用许可证有效期（天），默认 14 天
+TRIAL_DURATION_DAYS = int(os.getenv("TRIAL_DURATION_DAYS", "14"))
+
+# --- 内存存储（加锁保证线程安全）---
+_lock = threading.Lock()
+PENDING_ACTIVATIONS = {}       # activationId → { **请求详情, _created_at }
+ACTIVE_LICENSES = {}           # licenseToken → { **许可证详情, licensePayload }
+ACTIVATION_SESSIONS = {}       # sessionId → { createdAt, status }
+
+
+# ============================================================
+#  工具函数
+# ============================================================
 
 def _utcnow_iso() -> str:
-    """返回当前 UTC 时间的 ISO 8601 字符串。"""
+    """返回当前 UTC 时间的 ISO 8601 字符串（以 Z 结尾）。"""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _epoch_now() -> int:
-    """返回当前 Unix 时间戳（秒）。"""
-    return int(datetime.now(timezone.utc).timestamp())
 
 
 def _b64url_encode(data: bytes) -> str:
     """Base64 URL-safe 编码，去掉末尾的 '='。"""
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    """Base64 URL-safe 解码，自动补齐 '='。"""
+    padding = 4 - len(s) % 4
+    if padding != 4:
+        s += "=" * padding
+    return base64.urlsafe_b64decode(s)
 
 
 def _make_jwt(payload: dict) -> str:
@@ -78,10 +104,22 @@ def _make_jwt(payload: dict) -> str:
                               ensure_ascii=False).encode("utf-8")
     payload_b64 = _b64url_encode(payload_json)
 
-    # 签名部分：Bruno 不验签，用随机字符串即可
+    # 签名部分：Bruno 不验签，用 payload 的 SHA-256 作为伪签名
     signature_b64 = _b64url_encode(hashlib.sha256(payload_json).digest())
 
     return f"{header_b64}.{payload_b64}.{signature_b64}"
+
+
+def _decode_jwt_payload(token: str) -> dict | None:
+    """解码 JWT 的 payload 部分（不验签），失败返回 None。"""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload_bytes = _b64url_decode(parts[1])
+        return json.loads(payload_bytes)
+    except Exception:
+        return None
 
 
 def _build_license_payload(pending: dict, license_type: str = None) -> dict:
@@ -117,23 +155,24 @@ def _build_license_payload(pending: dict, license_type: str = None) -> dict:
         payload["type"] = "trial"
         payload["trialActive"] = True
         payload["endDate"] = (
-            datetime.now(timezone.utc) + timedelta(days=14)
+            datetime.now(timezone.utc) + timedelta(days=TRIAL_DURATION_DAYS)
         ).isoformat().replace("+00:00", "Z")
 
     return payload
 
 
-def _build_license_response(decoded: dict) -> dict:
-    """构建激活/验证成功后返回给客户端的许可证详情。"""
-    return {
-        "licenseType": decoded.get("type", DEFAULT_LICENSE_TYPE),
-        "licenseKey": decoded.get("licenseKey"),
-        "email": decoded.get("email"),
-        "deviceId": decoded.get("deviceId"),
-        "createdAt": decoded.get("createdAt"),
-        "updatedAt": decoded.get("updatedAt"),
-        "plan": decoded.get("plan", DEFAULT_PLAN),
-    }
+def _cleanup_expired_pending():
+    """清理过期的待激活请求，防止内存泄漏。"""
+    now = time.time()
+    expired = [
+        aid for aid, info in PENDING_ACTIVATIONS.items()
+        if now - info.get("_created_at_ts", now) > PENDING_EXPIRY_SECONDS
+    ]
+    for aid in expired:
+        PENDING_ACTIVATIONS.pop(aid, None)
+        log.debug("清理过期 activationId=%s", aid)
+    if expired:
+        log.info("清理了 %d 个过期待激活请求", len(expired))
 
 
 # ============================================================
@@ -147,13 +186,14 @@ def activate_license():
 
     Bruno 客户端调用流程（activateLicense 函数）：
     1. 发送 { deviceId, deviceName, licenseKey, email, licenseServerUrl }
-    2. 如果响应包含 activationId → 需要后续 OTP 验证
-    3. 如果响应直接包含 licenseToken → 立即激活成功（组织许可证模式）
+    2. 如果响应包含 activationId → 需要后续 OTP 验证（路径 A，personal）
+    3. 如果响应直接包含 licenseToken → 立即激活成功（路径 B，organization）
     4. 客户端对 licenseToken 做 jwt.decode()，检查 deviceId 是否存在且匹配
     """
     payload = request.get_json(silent=True) or {}
-    log.info("收到激活请求: %s", {k: v for k, v in payload.items() if k != "licenseKey"})
-    log.debug("完整激活请求: %s", payload)
+    # 日志中脱敏：不记录 licenseKey
+    log.info("收到激活请求: deviceId=%s, email=%s, licenseServerUrl=%s",
+             payload.get("deviceId"), payload.get("email"), payload.get("licenseServerUrl"))
 
     license_key = payload.get("licenseKey", "")
     device_id = payload.get("deviceId", str(uuid.uuid4()))
@@ -161,29 +201,44 @@ def activate_license():
     email = payload.get("email")
     license_server_url = payload.get("licenseServerUrl")
 
-    # 生成激活 ID，进入待 OTP 验证状态
-    activation_id = str(uuid.uuid4())
-    activated_at = _utcnow_iso()
-
     pending = {
         "licenseKey": license_key,
         "deviceId": device_id,
         "deviceName": device_name,
         "email": email,
         "licenseServerUrl": license_server_url,
-        "activatedAt": activated_at,
+        "activatedAt": _utcnow_iso(),
         "plan": DEFAULT_PLAN,
         "licenseType": DEFAULT_LICENSE_TYPE,
     }
-    PENDING_ACTIVATIONS[activation_id] = pending
 
-    # 返回 activationId，Bruno 客户端会进入 OTP 验证流程
-    resp = {
-        "activationId": activation_id,
-    }
+    # 路径 B — 组织许可证：直接返回 licenseToken，跳过 OTP
+    if DEFAULT_LICENSE_TYPE == "organization":
+        license_payload = _build_license_payload(pending, license_type="organization")
+        token = _make_jwt(license_payload)
 
-    log.info("激活请求已受理，activationId=%s，等待 OTP 验证", activation_id)
-    return jsonify(resp), 200
+        with _lock:
+            ACTIVE_LICENSES[token] = {
+                **pending,
+                "licensePayload": license_payload,
+                "activatedAt": _utcnow_iso(),
+            }
+
+        log.info("组织许可证直接激活成功 (deviceId=%s)", device_id)
+        return jsonify({"licenseToken": token}), 200
+
+    # 路径 A — 个人许可证：返回 activationId，等待 OTP 验证
+    activation_id = str(uuid.uuid4())
+
+    with _lock:
+        _cleanup_expired_pending()
+        PENDING_ACTIVATIONS[activation_id] = {
+            **pending,
+            "_created_at_ts": time.time(),
+        }
+
+    log.info("个人许可证激活请求已受理，activationId=%s，等待 OTP 验证", activation_id)
+    return jsonify({"activationId": activation_id}), 200
 
 
 # ============================================================
@@ -200,30 +255,29 @@ def verify_activation_otp(activation_id: str):
     2. 如果响应包含 licenseToken → 验证成功
     3. 如果响应包含 error → 验证失败，显示错误信息
     4. 客户端对 licenseToken 做 jwt.decode()，检查 deviceId 是否存在且匹配
-    5. 将 licenseToken 存入 licenseStore（license.json）
+    5. 将 licenseToken 存入 licenseStore（license.json），licenseType='personal'
     """
     payload = request.get_json(silent=True) or {}
-    otp = payload.get("otp", "")
-    log.info("收到 OTP 验证: activationId=%s, otp=%s", activation_id, otp)
+    log.info("收到 OTP 验证: activationId=%s", activation_id)
 
-    pending = PENDING_ACTIVATIONS.get(activation_id)
+    with _lock:
+        pending = PENDING_ACTIVATIONS.pop(activation_id, None)
+
     if not pending:
         log.warning("无效的 activationId: %s", activation_id)
-        return jsonify({"error": "Invalid activationId"}), 404
+        return jsonify({"error": "Invalid or expired activationId"}), 404
 
     # 任意 OTP 都接受（自托管服务器不做实际验证）
-    license_payload = _build_license_payload(pending)
+    license_payload = _build_license_payload(pending, license_type="personal")
     token = _make_jwt(license_payload)
 
     # 存储已激活的许可证，用于后续 verify 端点
-    ACTIVE_LICENSES[token] = {
-        **pending,
-        "licensePayload": license_payload,
-        "activatedAt": _utcnow_iso(),
-    }
-
-    # 从待验证列表中移除
-    PENDING_ACTIVATIONS.pop(activation_id, None)
+    with _lock:
+        ACTIVE_LICENSES[token] = {
+            **pending,
+            "licensePayload": license_payload,
+            "activatedAt": _utcnow_iso(),
+        }
 
     log.info("OTP 验证成功，licenseToken 已签发 (deviceId=%s)", pending.get("deviceId"))
     return jsonify({"licenseToken": token}), 200
@@ -254,29 +308,24 @@ def verify_license():
     license_info = ACTIVE_LICENSES.get(license_token)
 
     if license_info:
-        # 已知令牌，直接返回验证成功
-        response = {
-            "verified": True,
-            "needsRefresh": False,
-            "subscription": {
-                "plan": license_info.get("plan", DEFAULT_PLAN),
-            },
-            "trial": None,
-            "aiPolicy": None,
-        }
-        log.info("许可证验证成功 (deviceId=%s)", device_id)
+        # 已知令牌，返回验证成功
+        plan = license_info.get("plan", DEFAULT_PLAN)
+        log.info("许可证验证成功 (deviceId=%s, plan=%s)", device_id, plan)
     else:
-        # 未知令牌也返回验证成功（自托管服务器接受所有令牌）
-        response = {
-            "verified": True,
-            "needsRefresh": False,
-            "subscription": {
-                "plan": DEFAULT_PLAN,
-            },
-            "trial": None,
-            "aiPolicy": None,
-        }
-        log.info("未知令牌，但仍返回验证成功 (deviceId=%s)", device_id)
+        # 未知令牌：尝试解码 JWT 获取 plan 信息
+        decoded = _decode_jwt_payload(license_token)
+        plan = decoded.get("plan", DEFAULT_PLAN) if decoded else DEFAULT_PLAN
+        log.info("未知令牌，解码后返回验证成功 (deviceId=%s, plan=%s)", device_id, plan)
+
+    response = {
+        "verified": True,
+        "needsRefresh": False,
+        "subscription": {
+            "plan": plan,
+        },
+        "trial": None,
+        "aiPolicy": None,
+    }
 
     return jsonify(response), 200
 
@@ -295,6 +344,7 @@ def refresh_license():
     2. 如果响应包含 activationId → 需要重新 OTP 验证
     3. 如果响应包含 error → 刷新失败
     4. 如果响应包含 licenseToken → 刷新成功，更新本地存储
+       注意：Bruno 源码在 refresh 后设置 licenseType='organization'
     """
     payload = request.get_json(silent=True) or {}
     license_token = payload.get("licenseToken", "")
@@ -303,6 +353,13 @@ def refresh_license():
 
     # 查找原许可证信息
     old_info = ACTIVE_LICENSES.get(license_token, {})
+
+    # 如果旧令牌存在，尝试从其 JWT payload 中获取更多信息
+    if not old_info:
+        decoded = _decode_jwt_payload(license_token)
+        if decoded:
+            old_info = decoded
+
     pending = {
         "licenseKey": old_info.get("licenseKey", f"refreshed-{uuid.uuid4().hex[:8]}"),
         "deviceId": device_id,
@@ -311,26 +368,29 @@ def refresh_license():
         "licenseServerUrl": old_info.get("licenseServerUrl"),
         "activatedAt": _utcnow_iso(),
         "plan": old_info.get("plan", DEFAULT_PLAN),
-        "licenseType": old_info.get("licenseType", DEFAULT_LICENSE_TYPE),
+        # Bruno 源码在 refresh 后设置 licenseType='organization'
+        "licenseType": "organization",
     }
 
-    new_payload = _build_license_payload(pending)
+    # Bruno 源码: licenseStore.set('licenseType', 'organization')
+    new_payload = _build_license_payload(pending, license_type="organization")
     new_token = _make_jwt(new_payload)
 
     # 更新存储
-    ACTIVE_LICENSES.pop(license_token, None)
-    ACTIVE_LICENSES[new_token] = {
-        **pending,
-        "licensePayload": new_payload,
-        "activatedAt": _utcnow_iso(),
-    }
+    with _lock:
+        ACTIVE_LICENSES.pop(license_token, None)
+        ACTIVE_LICENSES[new_token] = {
+            **pending,
+            "licensePayload": new_payload,
+            "activatedAt": _utcnow_iso(),
+        }
 
-    log.info("许可证令牌已刷新 (deviceId=%s)", device_id)
+    log.info("许可证令牌已刷新 (deviceId=%s, type=organization)", device_id)
     return jsonify({"licenseToken": new_token}), 200
 
 
 # ============================================================
-#  端点：升级 URL（用于显示购买/升级链接）
+#  端点：升级 URL
 # ============================================================
 
 @app.route("/api/v2/license/upgrade-url", methods=["POST"])
@@ -340,9 +400,8 @@ def get_upgrade_url():
 
     Bruno 客户端调用 getUpgradeUrl() 函数：
     1. 发送 { deviceId, licenseToken 或 email }
-    2. 响应必须包含 url 字段
+    2. 响应必须包含 url 字段（string 类型）
     """
-    payload = request.get_json(silent=True) or {}
     log.info("收到升级 URL 请求")
 
     upgrade_url = os.getenv(
@@ -394,14 +453,17 @@ def create_activation_session():
     log.info("收到创建激活会话请求")
 
     session_id = str(uuid.uuid4())
-    ACTIVATION_SESSIONS[session_id] = {
-        "createdAt": _utcnow_iso(),
-        "status": "active",
-    }
+    created_at = _utcnow_iso()
+
+    with _lock:
+        ACTIVATION_SESSIONS[session_id] = {
+            "createdAt": created_at,
+            "status": "active",
+        }
 
     return jsonify({
         "sessionId": session_id,
-        "createdAt": ACTIVATION_SESSIONS[session_id]["createdAt"],
+        "createdAt": created_at,
     }), 200
 
 
@@ -463,6 +525,9 @@ def activate_trial():
     Bruno 客户端调用 verifyTrialLicense() 函数：
     1. 发送 { email, verifier, deviceId, posthogDistinctId }
     2. 返回 licenseToken（试用类型）
+
+    Bruno isTrialLicenseValid() 检查：
+    - type='trial' 时 trialActive=true 且 endDate > now
     """
     payload = request.get_json(silent=True) or {}
     email = payload.get("email", "")
@@ -472,7 +537,7 @@ def activate_trial():
 
     now_iso = _utcnow_iso()
     trial_end = (
-        datetime.now(timezone.utc) + timedelta(days=14)
+        datetime.now(timezone.utc) + timedelta(days=TRIAL_DURATION_DAYS)
     ).isoformat().replace("+00:00", "Z")
 
     trial_payload = {
@@ -490,18 +555,20 @@ def activate_trial():
     }
 
     token = _make_jwt(trial_payload)
-    ACTIVE_LICENSES[token] = {
-        **trial_payload,
-        "licensePayload": trial_payload,
-        "activatedAt": now_iso,
-    }
 
-    log.info("试用许可证已激活 (deviceId=%s)", device_id)
+    with _lock:
+        ACTIVE_LICENSES[token] = {
+            **trial_payload,
+            "licensePayload": trial_payload,
+            "activatedAt": now_iso,
+        }
+
+    log.info("试用许可证已激活 (deviceId=%s, 有效期 %d 天)", device_id, TRIAL_DURATION_DAYS)
     return jsonify({"licenseToken": token}), 200
 
 
 # ============================================================
-#  SAML SSO 端点（基础占位）
+#  SAML SSO 端点（占位）
 # ============================================================
 
 @app.route("/api/v2/auth/sso/saml/acs/<subscription_id>", methods=["POST", "GET"])
@@ -523,15 +590,44 @@ def saml_acs(subscription_id: str):
 @app.route("/api/health", methods=["GET"])
 def health_check():
     """健康检查端点。"""
+    with _lock:
+        _cleanup_expired_pending()
+        pending_count = len(PENDING_ACTIVATIONS)
+        active_count = len(ACTIVE_LICENSES)
+        session_count = len(ACTIVATION_SESSIONS)
+
     return jsonify({
         "status": "ok",
         "service": "Bruno License Server",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "timestamp": _utcnow_iso(),
-        "pendingActivations": len(PENDING_ACTIVATIONS),
-        "activeLicenses": len(ACTIVE_LICENSES),
+        "pendingActivations": pending_count,
+        "activeLicenses": active_count,
+        "activationSessions": session_count,
         "defaultPlan": DEFAULT_PLAN,
+        "defaultLicenseType": DEFAULT_LICENSE_TYPE,
+        "trialDurationDays": TRIAL_DURATION_DAYS,
     }), 200
+
+
+# ============================================================
+#  错误处理
+# ============================================================
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Not found"}), 404
+
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({"error": "Method not allowed"}), 405
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    log.error("内部错误: %s", e)
+    return jsonify({"error": "Internal server error"}), 500
 
 
 # ============================================================
@@ -549,10 +645,12 @@ if __name__ == "__main__":
     debug = os.getenv("FLASK_DEBUG", "false").lower() in {"1", "true", "yes"}
 
     log.info("=" * 60)
-    log.info("Bruno License Server v2.0.0")
+    log.info("Bruno License Server v2.1.0")
     log.info("监听地址: %s:%s", host, port)
     log.info("默认许可证等级: %s", DEFAULT_PLAN)
     log.info("默认许可证类型: %s", DEFAULT_LICENSE_TYPE)
+    log.info("试用有效期: %d 天", TRIAL_DURATION_DAYS)
+    log.info("待激活过期时间: %d 秒", PENDING_EXPIRY_SECONDS)
     log.info("调试模式: %s", debug)
     log.info("=" * 60)
     log.info("支持的 API 端点:")

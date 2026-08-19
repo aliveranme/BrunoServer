@@ -12,7 +12,7 @@
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/v2/license/activate` | POST | 激活许可证（返回 activationId，需后续 OTP 验证） |
+| `/api/v2/license/activate` | POST | 激活许可证（个人→返回 activationId；组织→直接返回 licenseToken） |
 | `/api/v1/license/activate/<activationId>` | POST | OTP 验证，返回 licenseToken (JWT) |
 | `/api/v2/license/verify` | POST | 后台验证许可证令牌 |
 | `/api/v2/license/refresh` | POST | 刷新许可证令牌 |
@@ -22,44 +22,71 @@
 | `/api/v1/auth/license-activation/session/get` | POST | 获取激活会话详情 |
 | `/api/v1/trials` | POST | 请求试用许可证 |
 | `/api/v1/trials/activate` | POST | 激活试用许可证 |
+| `/api/v2/auth/sso/saml/acs/<id>` | POST/GET | SAML SSO ACS 端点（占位） |
 | `/health` | GET | 健康检查 |
 
-### 许可证验证流程
+### 许可证激活流程
+
+Bruno 客户端支持两条激活路径，由服务器配置 `BRUNO_LICENSE_TYPE` 决定：
 
 ```
-┌──────────┐                  ┌──────────────┐                  ┌──────────┐
-│  Bruno   │                  │ BrunoServer  │                  │  用户    │
-│  客户端  │                  │   (本服务)   │                  │          │
-└────┬─────┘                  └──────┬───────┘                  └────┬─────┘
-     │                               │                               │
-     │  1. POST /activate            │                               │
-     │  {licenseKey, email, deviceId}│                               │
-     │──────────────────────────────>│                               │
-     │                               │                               │
-     │  2. 返回 activationId         │                               │
-     │<──────────────────────────────│                               │
-     │                               │                               │
-     │                               │  3. 用户输入 OTP              │
-     │                               │<──────────────────────────────│
-     │                               │                               │
-     │  4. POST /activate/<id>       │                               │
-     │  {otp: "用户输入的值"}        │                               │
-     │──────────────────────────────>│                               │
-     │                               │                               │
-     │  5. 返回 licenseToken (JWT)   │                               │
-     │<──────────────────────────────│                               │
-     │                               │                               │
-     │  6. jwt.decode(token)         │                               │
-     │  验证 deviceId 匹配          │                               │
-     │  存入 license.json            │                               │
-     │                               │                               │
-     │  7. POST /verify (后台定期)   │                               │
-     │──────────────────────────────>│                               │
-     │  8. {verified: true}          │                               │
-     │<──────────────────────────────│                               │
-     │                               │                               │
-     │  激活完成 ✅                  │                               │
-     ─────────────────────────────────────────────────────────────────
+路径 A — 个人许可证 (BRUNO_LICENSE_TYPE=personal，默认):
+
+  Bruno 客户端                        BrunoServer
+      │                                   │
+      │  1. POST /activate                │
+      │  {licenseKey, email, deviceId}    │
+      │──────────────────────────────────>│
+      │                                   │
+      │  2. {activationId}                │
+      │<──────────────────────────────────│
+      │                                   │
+      │  3. POST /activate/<id>           │
+      │  {otp: "任意值"}                  │
+      │──────────────────────────────────>│
+      │                                   │
+      │  4. {licenseToken (JWT)}          │
+      │<──────────────────────────────────│
+      │                                   │
+      │  5. jwt.decode(token)             │
+      │  验证 deviceId 匹配              │
+      │  licenseType='personal'           │
+
+路径 B — 组织许可证 (BRUNO_LICENSE_TYPE=organization):
+
+  Bruno 客户端                        BrunoServer
+      │                                   │
+      │  1. POST /activate                │
+      │  {licenseKey, email, deviceId}    │
+      │──────────────────────────────────>│
+      │                                   │
+      │  2. {licenseToken (JWT)}          │  ← 直接返回，跳过 OTP
+      │<──────────────────────────────────│
+      │                                   │
+      │  3. jwt.decode(token)             │
+      │  验证 deviceId 匹配              │
+      │  licenseType='organization'       │
+```
+
+### 后台验证流程
+
+激活后，Bruno 客户端定期在后台验证许可证：
+
+```
+  Bruno 客户端                        BrunoServer
+      │                                   │
+      │  POST /verify                     │
+      │  {licenseToken, deviceId}         │
+      │──────────────────────────────────>│
+      │                                   │
+      │  {verified: true,                 │
+      │   needsRefresh: false,            │
+      │   subscription: {plan: ...}}      │
+      │<──────────────────────────────────│
+      │                                   │
+      │  更新 licenseStore:               │
+      │  licensePlan = subscription.plan  │
+      │  updatedAt = now()                │
 ```
 
 ## 安装
@@ -94,7 +121,7 @@ docker run -d --name bruno-server -p 5000:5000 bruno-server
 export FLASK_HOST=0.0.0.0
 export FLASK_PORT=8080
 export BRUNO_LICENSE_PLAN=ULTIMATE_EDITION  # PRO_EDITION / GOLDEN_EDITION / ULTIMATE_EDITION
-export BRUNO_LICENSE_TYPE=personal          # personal / organization
+export BRUNO_LICENSE_TYPE=personal          # personal（OTP 验证） / organization（直接激活）
 python server.py
 ```
 
@@ -123,15 +150,17 @@ export BRUNO_LICENSE_ENDPOINT=http://localhost:5000
 ## 运行测试
 
 ```bash
+# 安装测试依赖
+uv pip install requests --python .venv/Scripts/python.exe
+
 # 启动服务器
 python server.py &
 
 # 运行测试
-uv pip install requests --python .venv/Scripts/python.exe
 python test_server.py
 ```
 
-测试覆盖所有 API 端点，包括激活、OTP 验证、令牌验证、刷新、试用许可证等。
+测试覆盖所有 API 端点，包括个人许可证激活、OTP 验证、令牌验证、未知令牌验证、刷新、试用许可证等。
 
 ## 环境变量
 
@@ -141,7 +170,9 @@ python test_server.py
 | `FLASK_PORT` | `5000` | 服务器监听端口 |
 | `FLASK_DEBUG` | `false` | 调试模式 |
 | `BRUNO_LICENSE_PLAN` | `ULTIMATE_EDITION` | 许可证等级 |
-| `BRUNO_LICENSE_TYPE` | `personal` | 许可证类型 |
+| `BRUNO_LICENSE_TYPE` | `personal` | 许可证类型（`personal` 需 OTP，`organization` 直接激活） |
+| `TRIAL_DURATION_DAYS` | `14` | 试用许可证有效期（天） |
+| `PENDING_EXPIRY_SECONDS` | `1800` | 待激活请求过期时间（秒） |
 | `BRUNO_UPGRADE_URL` | `https://www.usebruno.com/pricing` | 升级链接 URL |
 
 ## 技术细节
@@ -172,12 +203,17 @@ Bruno 客户端 `verifyLicense()` 函数检查 `updatedAt` 字段，如果距今
 会清除本地许可证并要求用户重新激活。本服务器在 `/verify` 端点始终返回 `verified: true`，
 客户端会自动更新 `updatedAt` 为当前时间，因此无需每 60 天手动重新激活。
 
+### 刷新后许可证类型变更
+
+Bruno 源码中 `refreshLicenseToken()` 在刷新成功后设置 `licenseType='organization'`。
+本服务器遵循此行为，刷新后的新令牌中 `type` 字段为 `organization`。
+
 ### 许可证等级
 
 | 等级 | 功能 |
 |------|------|
 | `PRO_EDITION` | Pro 功能 |
-| `GOLDEN_EDITION` | Golden 功能（默认） |
+| `GOLDEN_EDITION` | Golden 功能（Bruno 客户端默认后备值） |
 | `ULTIMATE_EDITION` | 全部功能 |
 
 ## 部署
@@ -202,6 +238,7 @@ services:
       - "5000:5000"
     environment:
       - BRUNO_LICENSE_PLAN=ULTIMATE_EDITION
+      - BRUNO_LICENSE_TYPE=personal
     restart: unless-stopped
 ```
 
