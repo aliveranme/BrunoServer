@@ -7,3 +7,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: BRUNO_LICENSE_PLAN
+        value: ULTIMATE_EDITION
+      - key: BRUNO_LICENSE_TYPE
+        value: personal
