@@ -8,6 +8,11 @@
 
 基于从 Bruno v4.0.0 客户端 `app.asar` 逆向提取的 `src/utils/license.js` 源码实现，完整覆盖 Bruno 的许可证验证流程。
 
+提供两个版本：
+
+- **Python 版本**（根目录）：Flask + Gunicorn，内存存储，支持 Docker / Render 部署
+- **Cloudflare Workers 版本**（`worker/` 目录）：完全无状态设计，全球边缘部署，毫秒级冷启动
+
 ### 支持的 API 端点
 
 | 端点 | 方法 | 说明 |
@@ -124,6 +129,16 @@ export BRUNO_LICENSE_PLAN=ULTIMATE_EDITION  # PRO_EDITION / GOLDEN_EDITION / ULT
 export BRUNO_LICENSE_TYPE=personal          # personal（OTP 验证） / organization（直接激活）
 python server.py
 ```
+
+### 方式四：Cloudflare Workers 部署
+
+```bash
+cd worker
+npm install
+npx wrangler deploy
+```
+
+部署后获得 `https://bruno-license-server.<你的子域>.workers.dev`，配置参见 [worker/README.md](worker/README.md)。
 
 ## 配置 Bruno 客户端
 

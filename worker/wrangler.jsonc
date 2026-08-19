@@ -1,0 +1,12 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "bruno-license-server",
+  "main": "src/index.js",
+  "compatibility_date": "2025-03-01",
+  "vars": {
+    "BRUNO_LICENSE_PLAN": "ULTIMATE_EDITION",
+    "BRUNO_LICENSE_TYPE": "personal",
+    "TRIAL_DURATION_DAYS": "14",
+    "BRUNO_UPGRADE_URL": "https://www.usebruno.com/pricing"
+  }
+}

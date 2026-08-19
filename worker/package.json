@@ -1,0 +1,14 @@
+{
+  "name": "bruno-license-server-worker",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test test/worker-test.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
